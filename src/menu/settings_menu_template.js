@@ -1,6 +1,7 @@
 import { app } from "electron";
 import { BrowserWindow } from "electron";
 import { Notification  } from "electron";
+import { DEFAULT_CONFIG } from "../helpers/config";
 
 const prompt = require('electron-prompt');
 const fs = require('fs');
@@ -16,6 +17,12 @@ export default {
       accelerator: "CmdOrCtrl+I",
       click: () => {
         openInstancePrompt();
+      }
+    }, {
+      label: "Set MediaMTX Server URL",
+      accelerator: "CmdOrCtrl+M",
+      click: () => {
+        openMediaMTXPrompt();
       }
     }, {
       label: "Set Auto-Refresh Delay",
@@ -40,15 +47,27 @@ export default {
 };
 
 
-function openInstancePrompt() {
-  let path = app.getPath("userData") + "/config.json";
-  let rawdata = '{"url":"http://example.com","autorefresh":"-1","grid":"-1"}';
-  try {
-    rawdata = fs.readFileSync(path);
-  } catch {
+const DEFAULT_CONFIG_STR = JSON.stringify(DEFAULT_CONFIG);
 
+function readConfig() {
+  const configPath = app.getPath("userData") + "/config.json";
+  let rawdata = DEFAULT_CONFIG_STR;
+  try {
+    rawdata = fs.readFileSync(configPath);
+  } catch {
+    // Config doesn't exist yet; defaults will be used.
   }
-  let data = JSON.parse(rawdata);
+  return { path: configPath, data: Object.assign({}, DEFAULT_CONFIG, JSON.parse(rawdata)) };
+}
+
+function saveConfigAndRelaunch(configPath, data) {
+  fs.writeFileSync(configPath, JSON.stringify(data));
+  app.relaunch();
+  app.exit();
+}
+
+function openInstancePrompt() {
+  const { path: configPath, data } = readConfig();
   prompt({
     title: 'Set Instance URL',
     label: 'Instance URL:',
@@ -65,23 +84,39 @@ function openInstancePrompt() {
         console.log('user cancelled');
       } else {
         data.url = r;
-        fs.writeFileSync(path, JSON.stringify(data));
-        app.relaunch()
-        app.exit()
+        saveConfigAndRelaunch(configPath, data);
+      }
+    })
+    .catch(console.error);
+}
+
+function openMediaMTXPrompt() {
+  const { path: configPath, data } = readConfig();
+  prompt({
+    title: 'Set MediaMTX Server URL',
+    label: 'MediaMTX Server URL (e.g. http://192.168.1.10:8889):',
+    value: data.mediamtxUrl || '',
+    customStylesheet: promptCss,
+    height: 175,
+    inputAttrs: {
+      type: 'url',
+      placeholder: 'http://192.168.1.10:8889'
+    },
+    type: 'input'
+  })
+    .then((r) => {
+      if (r === null) {
+        console.log('user cancelled');
+      } else {
+        data.mediamtxUrl = r;
+        saveConfigAndRelaunch(configPath, data);
       }
     })
     .catch(console.error);
 }
 
 function openAutoRefreshPrompt() {
-  let path = app.getPath("userData") + "/config.json";
-  let rawdata = '{"url":"http://example.com","autorefresh":"-1","grid":"-1"}';
-  try {
-    rawdata = fs.readFileSync(path);
-  } catch {
-
-  }
-  let data = JSON.parse(rawdata);
+  const { path: configPath, data } = readConfig();
   prompt({
     title: 'Set Auto-Refresh Delay',
     label: 'Auto-Refresh Delay:',
@@ -96,75 +131,56 @@ function openAutoRefreshPrompt() {
         console.log('user cancelled');
       } else {
         data.autorefresh = r;
-        fs.writeFileSync(path, JSON.stringify(data));
-        app.relaunch()
-        app.exit()
+        saveConfigAndRelaunch(configPath, data);
       }
     })
     .catch(console.error);
 }
 
 function openGridPrompt() {
-  let path = app.getPath("userData") + "/config.json";
-  let rawdata = '{"url":"http://example.com","autorefresh":"-1","grid":"-1"}';
-  try {
-    rawdata = fs.readFileSync(path);
-  } catch {
+  const { path: configPath, data } = readConfig();
 
-  }
+  const gridUrl = data.url + "/getGrids";
+  let options = { json: true };
+  request(gridUrl, options, (error, res, body) => {
+    if (error) {
+      new Notification({
+        title: "Error!",
+        body: "Unable to fetch available grids.",
+      }).show();
+      return;
+    }
 
-  let data = JSON.parse(rawdata);
-
-  const url = data.url + "/getGrids";
-  let options = {json: true};
-  request(url, options, (error, res, body) => {
-      if (error) {
-        new Notification({
-          title: "Error!",
-          body: "Unable to fetch available grids.",
-        }).show();
-      };
-  
-      if (!error && res.statusCode == 200) {
-          if(body == undefined || body == []) {
-
+    if (res.statusCode == 200 && body != undefined && body.length > 0) {
+      const selectOptions = { "-1": "Server default" };
+      body.forEach(e => {
+        selectOptions[e] = e;
+      });
+      prompt({
+        title: 'Set Default Grid Override',
+        label: 'Grid for this client:',
+        customStylesheet: promptCss,
+        height: 175,
+        value: data.grid,
+        type: 'select',
+        selectOptions
+      })
+        .then((r) => {
+          if (r === null) {
+            console.log('user cancelled');
           } else {
-            options = {};
-            options["-1"] = "Server default";
-            body.forEach(e => {
-              options[e] = e;
-            });
-            prompt({
-              title: 'Set Default Grid Override',
-              label: 'Grid for this client:',
-              customStylesheet: promptCss,
-              height: 175,
-              value: data.grid,
-              type: 'select',
-              selectOptions: options
-            })
-              .then((r) => {
-                if (r === null) {
-                  console.log('user cancelled');
-                } else {
-                  data.grid = r;
-                  fs.writeFileSync(path, JSON.stringify(data));
-                  app.relaunch()
-                  app.exit()
-                }
-              })
-              .catch(() => {
-                new Notification({
-                  title: "Error!",
-                  body: "Unable to fetch available grids.",
-                }).show();
-              });
+            data.grid = r;
+            saveConfigAndRelaunch(configPath, data);
           }
-      };
+        })
+        .catch(() => {
+          new Notification({
+            title: "Error!",
+            body: "Unable to fetch available grids.",
+          }).show();
+        });
+    }
   });
-
-
-
 }
 
 function openSettings() {
