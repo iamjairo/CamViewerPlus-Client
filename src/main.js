@@ -1,8 +1,3 @@
-// This is main process of Electron, started as first thing when your
-// app starts. It runs through entire life of your application.
-// It doesn't have any windows which you can see on screen, but we can open
-// window from here.
-
 import path from "path";
 import url from "url";
 import { app, Menu, ipcMain, shell, Notification } from "electron";
@@ -10,6 +5,7 @@ import appMenuTemplate from "./menu/app_menu_template";
 import settingsMenuTemplate from "./menu/settings_menu_template";
 import devMenuTemplate from "./menu/dev_menu_template";
 import createWindow from "./helpers/window";
+import { DEFAULT_CONFIG } from "./helpers/config";
 const fs = require('fs');
 const cron = require('node-cron');
 
@@ -17,8 +13,25 @@ const cron = require('node-cron');
 // in config/env_xxx.json file.
 import env from "env";
 
+// Performance and memory flags
 app.commandLine.appendSwitch('js-flags', '--max-old-space-size=4096');
 app.commandLine.appendSwitch('max-active-webgl-contexts=16');
+
+// WebRTC and streaming optimisations
+app.commandLine.appendSwitch('autoplay-policy', 'no-user-gesture-required');
+app.commandLine.appendSwitch('enable-accelerated-video-decode');
+app.commandLine.appendSwitch('enable-accelerated-mjpeg-decode');
+app.commandLine.appendSwitch('disable-frame-rate-limit');
+app.commandLine.appendSwitch('enable-features', 'WebRTCPipeWireCapturer,WebRTC-H264WithOpenH264FFmpeg,PlatformHEVCDecoderSupport,WebCodecs,MediaCapabilitiesQueryGpuFactories');
+app.commandLine.appendSwitch('enable-hardware-overlays', 'single-fullscreen,single-on-top,underlay');
+app.commandLine.appendSwitch('enable-gpu-rasterization');
+
+// IP cameras commonly use self-signed TLS certificates.  Allow those in
+// non-production environments; in production the flag is intentionally
+// omitted so the OS certificate store is respected.
+if (env.name !== "production") {
+  app.commandLine.appendSwitch('ignore-certificate-errors');
+}
 
 // Save userData in separate folders for each environment.
 // Thanks to this you can use production and development versions of the app
@@ -28,9 +41,8 @@ if (env.name !== "production") {
   app.setPath("userData", `${userDataPath} (${env.name})`);
 }
 
-if (process.platform === 'win32')
-{
-    app.setAppUserModelId(app.name);
+if (process.platform === 'win32') {
+  app.setAppUserModelId(app.name);
 }
 
 const setApplicationMenu = () => {
@@ -38,8 +50,6 @@ const setApplicationMenu = () => {
   if (env.name !== "production") {
     menus.push(devMenuTemplate);
   }
-  menus.push(devMenuTemplate);
-
   Menu.setApplicationMenu(Menu.buildFromTemplate(menus));
 };
 
@@ -54,23 +64,34 @@ const initIpc = () => {
 };
 
 function getConfig() {
-  let path = app.getPath("userData") + "/config.json";
-  let rawdata = '{"url":"http://example.com","autorefresh":"-1"}';
+  const configPath = app.getPath("userData") + "/config.json";
+  let data = Object.assign({}, DEFAULT_CONFIG);
   try {
-    rawdata = fs.readFileSync(path);
+    data = Object.assign(data, JSON.parse(fs.readFileSync(configPath)));
   } catch {
-
+    // Config doesn't exist yet; defaults will be used.
   }
-  let data = JSON.parse(rawdata);
   let appurl = {};
-  if (data.url === "http://example.com") {
+  if (!data.url || data.url === DEFAULT_CONFIG.url) {
     appurl.name = __dirname + "/no-url.html";
     appurl.protocol = "file:";
   } else {
-    appurl.name = data.url.replace("http://", "");
-    appurl.protocol = "http:";
+    try {
+      const parsed = new URL(data.url);
+      appurl.name = parsed.host + parsed.pathname.replace(/\/$/, "");
+      appurl.protocol = parsed.protocol;
+    } catch {
+      // Fallback for malformed URLs
+      appurl.name = data.url.replace(/^https?:\/\//, "");
+      appurl.protocol = "http:";
+    }
   }
-  return { "url": appurl, "autorefresh": data.autorefresh, "grid": data.grid };
+  return {
+    url: appurl,
+    autorefresh: data.autorefresh,
+    grid: data.grid,
+    mediamtxUrl: data.mediamtxUrl || ""
+  };
 }
 
 app.on("ready", () => {
@@ -83,69 +104,70 @@ app.on("ready", () => {
     width: 1000,
     height: 600,
     webPreferences: {
-      // Two properties below are here for demo purposes, and are
-      // security hazard. Make sure you know what you're doing
-      // in your production app.
-      nodeIntegration: true,
+      nodeIntegration: false,
       contextIsolation: false,
       allowRunningInsecureContent: true,
-      nodeIntegration: false,
-      // Spectron needs access to remote module
-      enableRemoteModule: env.name === "test"
+      // webSecurity is disabled so that the CamViewerPlus web UI (loaded from
+      // a configured server origin) can make cross-origin requests to MediaMTX
+      // WHEP endpoints.  This is intentional for a dedicated camera-viewer
+      // desktop client that only ever loads known, user-configured servers.
+      webSecurity: false
     }
   });
 
-  if (config.autorefresh != -1) {
+  // Permissions required for WebRTC (WHEP/camera streams) and notifications.
+  // Only the specific capabilities needed by live-streaming are granted.
+  const ALLOWED_PERMISSIONS = [
+    'media',
+    'display-capture',
+    'fullscreen',
+    'notifications',
+    'pointerLock',
+    'mediaKeySystem'
+  ];
+  mainWindow.webContents.session.setPermissionRequestHandler(
+    (webContents, permission, callback) => {
+      callback(ALLOWED_PERMISSIONS.includes(permission));
+    }
+  );
+  mainWindow.webContents.session.setPermissionCheckHandler(
+    (webContents, permission) => ALLOWED_PERMISSIONS.includes(permission)
+  );
+
+  if (config.autorefresh && config.autorefresh !== "-1") {
     cron.schedule(config.autorefresh, () => {
-      console.log("reloading...")
+      console.log("reloading...");
       mainWindow.webContents.reloadIgnoringCache();
     });
   }
 
-  if (config.grid != "-1" && config.grid != undefined) {
-    mainWindow.loadURL(
-      url.format({
-        // pathname: path.join(__dirname, "app.html"),
-        pathname: config.url.name + "/grids/" + config.grid,
-        protocol: config.url.protocol,
-        slashes: true,
-        query: {
-          "cl":"cvpc"
-        }
-      })
-    );
+  const buildLoadURL = (pathname) =>
+    url.format({
+      pathname,
+      protocol: config.url.protocol,
+      slashes: true,
+      query: { cl: "cvpc" }
+    });
+
+  if (config.grid && config.grid !== "-1") {
+    mainWindow.loadURL(buildLoadURL(config.url.name + "/grids/" + config.grid));
   } else {
-    mainWindow.loadURL(
-      url.format({
-        // pathname: path.join(__dirname, "app.html"),
-        pathname: config.url.name,
-        protocol: config.url.protocol,
-        slashes: true,
-        query: {
-          "cl":"cvpc"
-        }
-      })
-    );
+    mainWindow.loadURL(buildLoadURL(config.url.name));
   }
 
-  mainWindow.webContents.on("did-fail-load", function() {
+  mainWindow.webContents.on("did-fail-load", () => {
     new Notification({
       title: "Error!",
       body: "Unable to connect to CamViewerPlus Server. Please double-check your instance URL.",
     }).show();
     mainWindow.loadURL(
       url.format({
-        // pathname: path.join(__dirname, "app.html"),
         pathname: __dirname + "/error.html",
         protocol: "file:",
         slashes: true
       })
     );
   });
-
-  // if (env.name === "development") {
-  //   mainWindow.openDevTools();
-  // }
 });
 
 app.on("window-all-closed", () => {
